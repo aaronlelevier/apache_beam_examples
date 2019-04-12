@@ -1,0 +1,7 @@
+apache_beam
+tensorflow==1.12.0
+matplotlib
+numpy
+pillow
+jupyter
+notebook
