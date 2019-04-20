@@ -1,23 +1,28 @@
-from __future__ import absolute_import, division, print_function
+from __future__ import absolute_import, division
 
 import gzip
 import io
+import os
 
 import apache_beam as beam
-import IPython.display as display
-import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from apache_beam.options.pipeline_options import PipelineOptions
-from six.moves import xrange  # pylint: disable=redefined-builtin
-from tensorflow.contrib.learn.python import datasets
-from tensorflow.contrib.learn.python.learn.datasets import base
-from tensorflow.python.framework import dtypes, random_seed
+from logzero import logger
 from tensorflow.python.platform import gfile
-from tensorflow.python.util.deprecation import deprecated
 
 tf.enable_eager_execution()
+
+TFRECORD_OUTFILE = 'mnist'
+
+FEATURE_DESCRIPTION = {
+    'height': tf.FixedLenFeature([], tf.int64, default_value=0),
+    'width': tf.FixedLenFeature([], tf.int64, default_value=0),
+    'depth': tf.FixedLenFeature([], tf.int64, default_value=0),
+    'label': tf.FixedLenFeature([], tf.int64, default_value=0),
+    'image_raw': tf.FixedLenFeature([], tf.string, default_value=''),
+}
 
 
 def _read32(bytestream):
@@ -28,17 +33,17 @@ def _read32(bytestream):
 def extract_images(f):
     """Extract the images into a 4D uint8 numpy array [index, y, x, depth].
 
-  Args:
-    f: A file object that can be passed into a gzip reader.
+    Args:
+        f: A file object that can be passed into a gzip reader.
 
-  Returns:
-    data: A 4D uint8 numpy array [index, y, x, depth].
+    Returns:
+        data: A 4D uint8 numpy array [index, y, x, depth].
 
-  Raises:
-    ValueError: If the bytestream does not start with 2051.
+    Raises:
+        ValueError: If the bytestream does not start with 2051.
 
-  """
-    print('Extracting', f.name)
+    """
+    logger.info('Extracting: %s', f.name)
     with gzip.GzipFile(fileobj=f) as bytestream:
         magic = _read32(bytestream)
         if magic != 2051:
@@ -57,18 +62,18 @@ def extract_images(f):
 def extract_labels(f, one_hot=False, num_classes=10):
     """Extract the labels into a 1D uint8 numpy array [index].
 
-  Args:
-    f: A file object that can be passed into a gzip reader.
-    one_hot: Does one hot encoding for the result.
-    num_classes: Number of classes for the one hot encoding.
+    Args:
+        f: A file object that can be passed into a gzip reader.
+        one_hot: Does one hot encoding for the result.
+        num_classes: Number of classes for the one hot encoding.
 
-  Returns:
-    labels: a 1D uint8 numpy array.
+    Returns:
+        labels: a 1D uint8 numpy array.
 
-  Raises:
-    ValueError: If the bystream doesn't start with 2049.
-  """
-    print('Extracting', f.name)
+    Raises:
+        ValueError: If the bystream doesn't start with 2049.
+    """
+    logger.info('Extracting: %s', f.name)
     with gzip.GzipFile(fileobj=f) as bytestream:
         magic = _read32(bytestream)
         if magic != 2049:
@@ -93,6 +98,9 @@ def get_images_and_labels(images_path, labels_path):
     with gfile.Open(labels_path, 'rb') as f:
         labels = extract_labels(f)
 
+    logger.info('images shape: %s', images.shape)
+    logger.info('labels shape: %s', labels.shape)
+
     return images, labels
 
 
@@ -103,13 +111,6 @@ def _int64_feature(value):
 def _bytes_feature(value):
     return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
 
-
-
-
-images_path = '/tmp/data/mnist/val/images.gz'
-labels_path = '/tmp/data/mnist/val/labels.gz'
-
-val_images, val_labels = get_images_and_labels(images_path, labels_path)
 
 def get_images_and_labels_w_index(images, labels):
     """
@@ -122,65 +123,60 @@ def get_images_and_labels_w_index(images, labels):
     return images_w_index, labels_w_index
 
 
-images_w_index, labels_w_index = get_images_and_labels_w_index(val_images, val_labels)
-
-
-def get_nhwc(images):
-    """
-    Returns NHWC to use for creating `tf.train.Example`
-    """
-    N = images.shape[0]
-    rows = images.shape[1]
-    cols = images.shape[2]
-    depth = images.shape[3]
-    return N, rows, cols, depth
-
-
-N, rows, cols, depth = get_nhwc(val_images)
-
-
 def group_by_tf_example(key_value):
     _, value = key_value
     image = value['image'][0]
     label = value['label'][0]
+    height, width, depth = image.shape
     example = tf.train.Example(features=tf.train.Features(
         feature={
-            'height': _int64_feature(rows),
-            'width': _int64_feature(cols),
+            'height': _int64_feature(height),
+            'width': _int64_feature(width),
             'depth': _int64_feature(depth),
             'label': _int64_feature(int(label)),
             'image_raw': _bytes_feature(image.tostring())
         }))
     return example
 
+@beam.ptransform_fn
+@beam.typehints.with_input_types(beam.Pipeline)
+@beam.typehints.with_output_types(tf.train.Example)
+def _ImageToExample(pipeline, input_dict):
+    data_dir = input_dict['input-base']
 
-# images and labels combined and written to TFRecords gzip file
+    images_path = os.path.join(data_dir, 'images.gz')
+    labels_path = os.path.join(data_dir, 'labels.gz')
 
-tfrecord_outfile = 'mnist-out'
-file_name_suffix = '.gz'
+    images, labels = get_images_and_labels(images_path, labels_path)
 
-with beam.Pipeline(options=PipelineOptions()) as p:
-    label_line = p | "CreateLabel" >> beam.Create(labels_w_index[:1])
-    image_line = p | "CreateImage" >> beam.Create(images_w_index[:1])
+    images_w_index, labels_w_index = get_images_and_labels_w_index(
+        images, labels)
 
+    # Beam Pipeline
+    image_line = pipeline | "CreateImage" >> beam.Create(images_w_index[:1])
+    label_line = pipeline | "CreateLabel" >> beam.Create(labels_w_index[:1])
     group_by = ({
         'label': label_line,
         'image': image_line
     }) | beam.CoGroupByKey()
-
-    tf_example = group_by | "GroupByToTfExample" >> beam.Map(
-        group_by_tf_example)
-
-    serialize = (tf_example | 'SerializeDeterministically' >>
-                 beam.Map(lambda x: x.SerializeToString(deterministic=True)))
-
-    output = serialize | beam.io.WriteToTFRecord(tfrecord_outfile,
-                                                 file_name_suffix=file_name_suffix)
+    return (group_by | "GroupByToTfExample" >> beam.Map(group_by_tf_example))
 
 
-# read back TFRecord gzip file to confirm it was written correctly
+def write_tfrecords():
+    """
+    Main write function
+    """
+    input_dict = {'input-base': '/tmp/data/mnist/val/'}
+    with beam.Pipeline(options=PipelineOptions()) as p:
+        tf_example = p | "InputSourceToExample" >> _ImageToExample(input_dict)
 
-tfrecord_infile = '{}-00000-of-00001{}'.format(tfrecord_outfile, file_name_suffix)
+        serialize = (
+            tf_example | 'SerializeDeterministically' >>
+            beam.Map(lambda x: x.SerializeToString(deterministic=True)))
+
+        (serialize
+         | beam.io.WriteToTFRecord(TFRECORD_OUTFILE, file_name_suffix='.gz'))
+
 
 def get_raw_dataset(filename):
     filenames = [filename]
@@ -188,52 +184,54 @@ def get_raw_dataset(filename):
 
 
 def get_record(dataset):
-    for raw_record in dataset.take(1):
-        print(raw_record)
-        break
-    return raw_record
-
-
-feature_description = {
-    'height': tf.FixedLenFeature([], tf.int64, default_value=0),
-    'width': tf.FixedLenFeature([], tf.int64, default_value=0),
-    'depth': tf.FixedLenFeature([], tf.int64, default_value=0),
-    'label': tf.FixedLenFeature([], tf.int64, default_value=0),
-    'image_raw': tf.FixedLenFeature([], tf.string, default_value=''),
-}
+    return next(iter(dataset.take(1)))
 
 
 def _parse_function(example_proto):
     # Parse the input tf.Example proto using the dictionary above.
-    return tf.parse_single_example(example_proto, feature_description)
-
-
-raw_dataset = get_raw_dataset(tfrecord_infile)
-
-raw_record = get_record(raw_dataset)
-
-parsed_dataset = raw_dataset.map(_parse_function)
-
-parsed_record = get_record(parsed_dataset)
+    return tf.parse_single_example(example_proto, FEATURE_DESCRIPTION)
 
 
 def convert_parsed_record_to_ndarray(parsed_record):
     x = parsed_record['image_raw']
     x_np = x.numpy()
     bytestream = io.BytesIO(x_np)
+    rows = 28
+    cols = 28
     num_images = 1
     buf = bytestream.read(rows * cols * num_images)
     data = np.frombuffer(buf, dtype=np.uint8)
-    data = data.reshape(rows, cols, 1)
+    shape = (rows, cols, num_images)
+    data = data.reshape(*shape)
     assert isinstance(data, np.ndarray), type(data)
-    assert data.shape == (28, 28, 1)
+    assert data.shape == shape
     return data
 
 
-image_from_infile = convert_parsed_record_to_ndarray(parsed_record)
+def read_tfrecord():
+    """
+    Main read function
+
+    Reads a single image TFRecord and returns it as a np.ndarray
+    """
+    tfrecord_infile = '{}-00000-of-00001.gz'.format(TFRECORD_OUTFILE)
+
+    raw_dataset = get_raw_dataset(tfrecord_infile)
+
+    raw_record = get_record(raw_dataset)
+
+    parsed_dataset = raw_dataset.map(_parse_function)
+
+    parsed_record = get_record(parsed_dataset)
+
+    return convert_parsed_record_to_ndarray(parsed_record)
 
 
 def display_image(img):
+    """
+    Coverts a 1-channel np.ndarray to 3-channel and displays it
+    using matplotlib
+    """
     assert isinstance(img, np.ndarray), type(img)
 
     stacked_img = np.stack((np.squeeze(img), ) * 3, axis=-1)

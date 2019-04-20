@@ -3,9 +3,13 @@ tensorflow>=1.12.0
 matplotlib
 numpy
 pillow
+python-snappy
+logzero
+matplotlib
+
+# dev
 jupyter
 notebook
-python-snappy
 isort
 yapf
-logzero
+pylint
