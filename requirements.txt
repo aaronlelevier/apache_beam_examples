@@ -5,4 +5,7 @@ numpy
 pillow
 jupyter
 notebook
+python-snappy
 isort
+yapf
+logzero
