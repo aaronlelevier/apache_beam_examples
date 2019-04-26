@@ -1,6 +1,8 @@
 from __future__ import absolute_import, division
 
+import bisect
 import gzip
+import hashlib
 import io
 import os
 
@@ -10,8 +12,8 @@ import numpy as np
 import tensorflow as tf
 from apache_beam.options.pipeline_options import PipelineOptions
 from logzero import logger
-from tensorflow.python.platform import gfile
 from tensorflow.contrib.learn.python.learn.datasets import mnist
+from tensorflow.python.platform import gfile
 
 tf.enable_eager_execution()
 
@@ -24,6 +26,9 @@ FEATURE_DESCRIPTION = {
     'label': tf.FixedLenFeature([], tf.int64, default_value=0),
     'image_raw': tf.FixedLenFeature([], tf.string, default_value=''),
 }
+
+SLICE = slice(0, 10)
+SPLITS = ['train', 'eval']
 
 
 def _read32(bytestream):
@@ -139,6 +144,20 @@ def group_by_tf_example(key_value):
         }))
     return example
 
+
+def _partition_fn(
+        record,
+        num_partitions,  # pylint: disable=unused-argument
+        buckets):
+    bucket = int(hashlib.sha256(record).hexdigest(), 16) % buckets[-1]
+    # For example, if buckets is [10,50,80], there will be 3 splits:
+    #   bucket >=0 && < 10, returns 0
+    #   bucket >=10 && < 50, returns 1
+    #   bucket >=50 && < 80, returns 2
+    int_split = bisect.bisect(buckets, bucket)
+    return int_split
+
+
 @beam.ptransform_fn
 @beam.typehints.with_input_types(beam.Pipeline)
 @beam.typehints.with_output_types(tf.train.Example)
@@ -154,8 +173,8 @@ def _ImageToExample(pipeline, input_dict):
         images, labels)
 
     # Beam Pipeline
-    image_line = pipeline | "CreateImage" >> beam.Create(images_w_index[:1])
-    label_line = pipeline | "CreateLabel" >> beam.Create(labels_w_index[:1])
+    image_line = pipeline | "CreateImage" >> beam.Create(images_w_index[SLICE])
+    label_line = pipeline | "CreateLabel" >> beam.Create(labels_w_index[SLICE])
     group_by = ({
         'label': label_line,
         'image': image_line
@@ -169,6 +188,7 @@ def write_tfrecords():
     """
     maybe_download()
     input_dict = {'input-base': '/tmp/data/mnist/val/'}
+    buckets = [50, 100]
     with beam.Pipeline(options=PipelineOptions()) as p:
         tf_example = p | "InputSourceToExample" >> _ImageToExample(input_dict)
 
@@ -176,8 +196,13 @@ def write_tfrecords():
             tf_example | 'SerializeDeterministically' >>
             beam.Map(lambda x: x.SerializeToString(deterministic=True)))
 
-        (serialize
-         | beam.io.WriteToTFRecord(TFRECORD_OUTFILE, file_name_suffix='.gz'))
+        example_splits = (serialize | 'SplitData' >> beam.Partition(
+            _partition_fn, len(buckets), buckets))
+
+        for i, example_split in enumerate(example_splits):
+            split_name = SPLITS[i]
+            (example_split | "Write." + split_name >> beam.io.WriteToTFRecord(
+                split_name + '-' + TFRECORD_OUTFILE, file_name_suffix='.gz'))
 
 
 def maybe_download():
@@ -207,10 +232,8 @@ def maybe_download():
     # move to desired locations and rename
     def move_to_dest(target_dir, from_file, to_file):
         try:
-            os.rename(
-                os.path.join(data_dir, from_file),
-                os.path.join(target_dir, to_file)
-            )
+            os.rename(os.path.join(data_dir, from_file),
+                      os.path.join(target_dir, to_file))
         except OSError:
             # file already moved
             pass
@@ -231,8 +254,10 @@ def get_raw_dataset(filename):
     return tf.data.TFRecordDataset(filenames, compression_type='GZIP')
 
 
-def get_record(dataset):
-    return next(iter(dataset.take(1)))
+def get_record(dataset, idx=0):
+    for i, x in enumerate(dataset.take(idx + 1)):
+        if i == idx:
+            return x
 
 
 def _parse_function(example_proto):
@@ -256,21 +281,19 @@ def convert_parsed_record_to_ndarray(parsed_record):
     return data
 
 
-def read_tfrecord():
+def read_tfrecord(
+        tfrecord_infile='{}-00000-of-00001.gz'.format(TFRECORD_OUTFILE),
+        idx=0):
     """
     Main read function
 
     Reads a single image TFRecord and returns it as a np.ndarray
     """
-    tfrecord_infile = '{}-00000-of-00001.gz'.format(TFRECORD_OUTFILE)
-
     raw_dataset = get_raw_dataset(tfrecord_infile)
-
-    raw_record = get_record(raw_dataset)
 
     parsed_dataset = raw_dataset.map(_parse_function)
 
-    parsed_record = get_record(parsed_dataset)
+    parsed_record = get_record(parsed_dataset, idx)
 
     return convert_parsed_record_to_ndarray(parsed_record)
 
