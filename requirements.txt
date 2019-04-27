@@ -1,11 +1,14 @@
 apache_beam
-tensorflow>=1.12.0
 matplotlib
 numpy
 pillow
 python-snappy
 logzero
 matplotlib
+
+# tf
+tensorflow>=1.13.0
+tensorflow-data-validation
 
 # dev
 jupyter
