@@ -210,17 +210,25 @@ def maybe_download():
     Will download MNIST gzip files and move them to the correct
     locations if not already present
     """
-    should_download = True
+    should_download = False
     data_dir = '/tmp/data/mnist'
 
     for x in ['train', 'val']:
-        target_dir = os.path.join(data_dir, x)
-        if not os.path.exists(target_dir):
-            os.makedirs(target_dir)
-        else:
-            # dir's exist, so we assume data is already present
-            # and in the correct locations
-            should_download = False
+        train_or_val_dir = os.path.join(data_dir, x)
+        if not os.path.exists(train_or_val_dir):
+            os.makedirs(train_or_val_dir)
+
+        for fname in ['images', 'labels']:
+            idx = 3 if x == 'images' else 1
+            if x == 'train':
+                path_to_check = os.path.join(
+                    train_or_val_dir, 'train-{}-idx1-ubyte.gz'.format(idx, fname))
+            else:
+                path_to_check = os.path.join(
+                    train_or_val_dir, 't10k-{}-idx1-ubyte.gz'.format(fname))
+
+            if not os.path.isfile(path_to_check):
+                should_download = True
 
     if not should_download:
         logger.info('data already present, no need to download')
